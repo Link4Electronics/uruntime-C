@@ -1,0 +1,393 @@
+name: CI
+
+on:
+  push:
+    branches:
+    - action
+    tags:
+    - '*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: uruntime-${{ matrix.arch }}-${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64, arm32v7, i386, riscv64, ppc64le, loongarch64, s390x]
+        variant: [runimage, appimage, appimage-dwarfs-lite]
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+            image: alpine:latest
+          - arch: aarch64
+            platform: linux/arm64
+            image: arm64v8/alpine:latest
+          - arch: arm32v7
+            platform: linux/arm/v7
+            image: arm32v7/alpine:latest
+          - arch: i386
+            platform: linux/386
+            image: i386/alpine:latest
+          - arch: riscv64
+            platform: linux/riscv64
+            image: riscv64/alpine:latest
+          - arch: ppc64le
+            platform: linux/ppc64le
+            image: ppc64le/alpine:latest
+          - arch: loongarch64
+            platform: linux/loong64
+            image: loongarch64/alpine:3.21
+          - arch: s390x
+            platform: linux/s390x
+            image: s390x/alpine:latest
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build in Docker
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/root" \
+            -w /root \
+            --platform=${{ matrix.platform }} \
+            ${{ matrix.image }} \
+            sh -c "
+              set -ex
+
+              # Install build dependencies
+              apk add --no-cache \
+                gcc musl-dev zstd-dev xxhash-dev cmake make \
+                linux-headers bash binutils findutils curl zstd xxhash \
+                libcap-dev \
+                zlib-dev xz-dev lz4-dev lzo-dev attr-dev git
+
+              # upx may not be available on all arches
+              apk add --no-cache upx 2>/dev/null || true
+
+              # Static libs for fully static tool builds (may not be available on all arches)
+              for _s in zstd-static xxhash-static zlib-static xz-static lz4-static; do
+                apk add --no-cache \${_s} 2>/dev/null || true
+              done
+
+              # Build static libraries from source when packages are unavailable
+              for _lib in zstd xxhash; do
+                if [ ! -f \"/usr/lib/lib\${_lib}.a\" ] && [ ! -f \"/lib/lib\${_lib}.a\" ]; then
+                  case \${_lib} in
+                    zstd)
+                      git clone --depth 1 --branch v1.5.7 \
+                        https://github.com/facebook/zstd.git /tmp/zstd 2>/dev/null || true
+                      make -C /tmp/zstd/lib libzstd.a -j\$(nproc) 2>/dev/null || \
+                        make -C /tmp/zstd/lib libzstd.a -j\$(nproc)
+                      cp /tmp/zstd/lib/libzstd.a /usr/lib/ 2>/dev/null || true
+                      ;;
+                    xxhash)
+                      git clone --depth 1 --branch v0.8.3 \
+                        https://github.com/Cyan4973/xxHash.git /tmp/xxhash 2>/dev/null || true
+                      make -C /tmp/xxhash libxxhash.a -j\$(nproc) 2>/dev/null || \
+                        make -C /tmp/xxhash libxxhash.a -j\$(nproc)
+                      cp /tmp/xxhash/libxxhash.a /usr/lib/ 2>/dev/null || true
+                      ;;
+                  esac
+                fi
+              done
+
+              # Build SquashFS tools (unsquashfs, mksquashfs) from source
+              mkdir -p assets
+              SQUASHFS_TOOLS_VER='4.7.5'
+              git clone --depth 1 --branch "\${SQUASHFS_TOOLS_VER}" \
+                https://github.com/plougher/squashfs-tools.git /tmp/squashfs-tools 2>/dev/null
+              make -C /tmp/squashfs-tools/squashfs-tools -j\$(nproc) \
+                EXTRA_LDFLAGS="-static" \
+                XZ_SUPPORT=1 LZO_SUPPORT=1 LZ4_SUPPORT=1 ZSTD_SUPPORT=1 2>/dev/null || {
+                echo 'Static build failed, retrying without -static'
+                make -C /tmp/squashfs-tools/squashfs-tools -j\$(nproc) clean 2>/dev/null
+                make -C /tmp/squashfs-tools/squashfs-tools -j\$(nproc) \
+                  XZ_SUPPORT=1 LZO_SUPPORT=1 LZ4_SUPPORT=1 ZSTD_SUPPORT=1
+              }
+              cp /tmp/squashfs-tools/squashfs-tools/unsquashfs assets/
+              cp /tmp/squashfs-tools/squashfs-tools/mksquashfs assets/ 2>/dev/null || true
+              zstd --ultra -22 -f -o assets/unsquashfs-zst assets/unsquashfs || \
+                zstd -19 -f -o assets/unsquashfs-zst assets/unsquashfs
+              [ -f assets/mksquashfs ] && \
+                zstd --ultra -22 -f -o assets/mksquashfs-zst assets/mksquashfs || \
+                zstd -19 -f -o assets/mksquashfs-zst assets/mksquashfs
+
+              # Map arch for asset download (before squashfuse/VHSgunzo URLs)
+              case '${{ matrix.arch }}' in
+                x86_64)  DARCH='x86_64'  ; DWARCH='x86_64'   ;;
+                aarch64) DARCH='aarch64' ; DWARCH='aarch64'   ;;
+                arm32v7) DARCH='arm'     ; DWARCH='arm'       ;;
+                i386)    DARCH='i386'    ; DWARCH='i386'      ;;
+                riscv64) DARCH='riscv64'     ; DWARCH='riscv64'       ;;
+                ppc64le) DARCH='ppc64le'     ; DWARCH='ppc64le'       ;;
+                loongarch64) DARCH='loongarch64' ; DWARCH='loongarch64' ;;
+                s390x) DARCH='s390x'        ; DWARCH='s390x'         ;;
+              esac
+
+              # Build squashfuse from source
+              apk add --no-cache fuse3-dev fuse3-static automake autoconf libtool 2>/dev/null || true
+              git clone --depth 1 --branch 0.6.1 \
+                https://github.com/vasi/squashfuse.git /tmp/squashfuse
+              cd /tmp/squashfuse
+              autoreconf -fi
+              LDFLAGS="-static" ./configure --disable-dl 2>/dev/null || ./configure --disable-dl
+              make -j\$(nproc) 2>/dev/null || make -j\$(nproc)
+              cp squashfuse /root/assets/ 2>/dev/null || true
+              cd /root
+              [ -f assets/squashfuse ] && chmod 755 assets/squashfuse && \
+                zstd --ultra -22 -f -o assets/squashfuse-zst assets/squashfuse || \
+                zstd -19 -f -o assets/squashfuse-zst assets/squashfuse
+
+              # Set CMake flags based on variant
+              case '${{ matrix.variant }}' in
+                runimage)
+                  EXTRA='-DURUNTIME_SQUASHFS=ON -DURUNTIME_DWARFS=ON'
+                  MAGIC='RI'
+                  ;;
+                appimage)
+                  EXTRA='-DURUNTIME_APPIMAGE=ON -DURUNTIME_SQUASHFS=ON -DURUNTIME_DWARFS=ON'
+                  MAGIC='AI'
+                  ;;
+                appimage-dwarfs-lite)
+                  EXTRA='-DURUNTIME_APPIMAGE=ON -DURUNTIME_SQUASHFS=ON -DURUNTIME_LITE=ON'
+                  MAGIC='AI'
+                  ;;
+              esac
+
+              # Download and prepare DwarFS binaries if available
+              if [ '${{ matrix.variant }}' != 'appimage-dwarfs-lite' ]; then
+                DWARFS_VER='0.15.3'
+
+                # Download dwarfs-universal (needs upx)
+                if command -v upx >/dev/null 2>&1; then
+                  dw_url="https://github.com/mhx/dwarfs/releases/download/v\${DWARFS_VER}/dwarfs-universal-\${DWARFS_VER}-Linux-\${DWARCH}.upx"
+                  dw_upx="assets/dwarfs-universal.upx"
+                  dw_bin="assets/dwarfs-universal"
+                  dw_zst="assets/dwarfs-universal-zst"
+
+                  if [ ! -f "\${dw_zst}" ] && curl -L --fail --insecure -o "\${dw_upx}" "\${dw_url}"; then
+                    chmod 755 "\${dw_upx}"
+                    upx -d "\${dw_upx}" -o "\${dw_bin}" && chmod 755 "\${dw_bin}"
+                    zstd --ultra -22 -f -o "\${dw_zst}" "\${dw_bin}" || zstd -19 -f -o "\${dw_zst}" "\${dw_bin}"
+                  fi
+                fi
+
+                # Download dwarfsextract (non-UPX) for extraction operations
+                dwse_url="https://github.com/mhx/dwarfs/releases/download/v\${DWARFS_VER}/dwarfs-fuse-extract-\${DWARFS_VER}-Linux-\${DWARCH}"
+                if [ ! -f "assets/dwarfsextract-zst" ] && curl -L --fail --insecure -o "assets/dwarfsextract" "\${dwse_url}"; then
+                  chmod 755 "assets/dwarfsextract"
+                  zstd --ultra -22 -f -o "assets/dwarfsextract-zst" "assets/dwarfsextract" || zstd -19 -f -o "assets/dwarfsextract-zst" "assets/dwarfsextract"
+                fi
+
+                # Check if any DwarFS binary was downloaded
+                if [ ! -f "assets/dwarfs-universal-zst" ] && [ ! -f "assets/dwarfsextract-zst" ]; then
+                  echo 'DwarFS binaries not available for this arch, building without DwarFS support'
+                  EXTRA="\${EXTRA/-DURUNTIME_DWARFS=ON/-DURUNTIME_DWARFS=OFF}"
+                fi
+              fi
+
+              # Build
+              cmake -S . -B build \
+                -DCMAKE_BUILD_TYPE=MinSizeRel \
+                -DURUNTIME_STATIC=ON \
+                \${EXTRA}
+
+              cmake --build build -j\$(nproc) 2>&1 | head -200
+
+              # Copy result
+              BIN_NAME=\"uruntime-${{ matrix.variant }}-${{ matrix.arch }}\"
+              cp build/uruntime /root/\${BIN_NAME}
+              strip --strip-all /root/\${BIN_NAME} 2>/dev/null || true
+
+              # Add magic bytes at offset 8 (AI or RI)
+              printf \"\${MAGIC}\\002\" | dd of=/root/\${BIN_NAME} bs=1 seek=8 count=3 conv=notrunc 2>/dev/null || true
+
+              # Add ELF sections from sections/ dir if present
+              if [ -d /root/sections ]; then
+                if command -v llvm-objcopy >/dev/null 2>&1 || command -v objcopy >/dev/null 2>&1; then
+                  OBJCOPY=\$(command -v llvm-objcopy || command -v objcopy)
+                  for sf in /root/sections/*; do
+                    if [ -f \"\${sf}\" ]; then
+                      sec_name=\".\$(basename \${sf})\"
+                      \$OBJCOPY --add-section=\${sec_name}=\${sf} --set-section-flags=\${sec_name}=noload,readonly /root/\${BIN_NAME} 2>/dev/null || true
+                    fi
+                  done
+                fi
+              fi
+            "
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uruntime-${{ matrix.variant }}-${{ matrix.arch }}
+          path: uruntime-${{ matrix.variant }}-${{ matrix.arch }}
+
+  build_ppc64:
+    name: uruntime-ppc64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install QEMU user-mode
+        run: |
+          sudo apt update && sudo apt install -y qemu-user-static binfmt-support
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build in QEMU chroot
+        run: |
+          docker create --name ppc64src kth5/archpower:latest-ppc64 /bin/true
+          sudo mkdir -p ${{ github.workspace }}/ppc64-rootfs
+          docker export ppc64src | sudo tar xf - -C ${{ github.workspace }}/ppc64-rootfs
+          docker rm ppc64src
+          sudo rm -rf ${{ github.workspace }}/ppc64-rootfs/var/cache/pacman/pkg/*
+          sudo sed -i 's/^DownloadUser/#DownloadUser/' ${{ github.workspace }}/ppc64-rootfs/etc/pacman.conf
+          sudo sed -i 's/^#DisableSandbox/DisableSandbox/' ${{ github.workspace }}/ppc64-rootfs/etc/pacman.conf
+          sudo sed -i 's/^SigLevel.*/SigLevel = Never/' ${{ github.workspace }}/ppc64-rootfs/etc/pacman.conf
+          sudo sed -i 's/^LocalFileSigLevel.*/LocalFileSigLevel = Never/' ${{ github.workspace }}/ppc64-rootfs/etc/pacman.conf
+          sudo touch ${{ github.workspace }}/ppc64-rootfs/etc/mtab
+          sudo mkdir -p ${{ github.workspace }}/ppc64-rootfs/proc \
+                        ${{ github.workspace }}/ppc64-rootfs/var/cache/pacman/pkg
+          sudo mount --bind /proc ${{ github.workspace }}/ppc64-rootfs/proc
+          sudo mount -t tmpfs -o size=2G tmpfs ${{ github.workspace }}/ppc64-rootfs/var/cache/pacman/pkg
+          sudo cp /usr/bin/qemu-ppc64-static ${{ github.workspace }}/ppc64-rootfs/usr/bin/
+          sudo cp /etc/resolv.conf ${{ github.workspace }}/ppc64-rootfs/etc/
+          sudo mkdir -p ${{ github.workspace }}/ppc64-rootfs/build/src
+          sudo cp -r src ${{ github.workspace }}/ppc64-rootfs/build/
+          sudo cp CMakeLists.txt embed_compress.c ${{ github.workspace }}/ppc64-rootfs/build/
+          sudo chroot ${{ github.workspace }}/ppc64-rootfs /bin/bash -c "
+            set -ex
+            pacman -Sy --noconfirm && \
+            pacman -Sw --noconfirm gcc make cmake pkgconf zstd xxhash libcap curl git automake autoconf libtool fuse3 lzo lz4 xz
+            for pkg in /var/cache/pacman/pkg/*.pkg.tar.*; do
+              tar --zstd -xf \"\$pkg\" -C / 2>/dev/null || tar -xf \"\$pkg\" -C / 2>/dev/null || true
+            done
+            cd /build
+            mkdir -p assets
+
+            # Build squashfs-tools
+            SQUASHFS_TOOLS_VER='4.7.5'
+            git clone --depth 1 --branch \"\${SQUASHFS_TOOLS_VER}\" \
+              https://github.com/plougher/squashfs-tools.git /tmp/squashfs-tools 2>/dev/null
+            make -C /tmp/squashfs-tools/squashfs-tools -j\$(nproc) \
+              XZ_SUPPORT=1 LZO_SUPPORT=1 LZ4_SUPPORT=1 ZSTD_SUPPORT=1 2>/dev/null || \
+            make -C /tmp/squashfs-tools/squashfs-tools -j\$(nproc) \
+              XZ_SUPPORT=1 LZO_SUPPORT=1 LZ4_SUPPORT=1 ZSTD_SUPPORT=1
+            cp /tmp/squashfs-tools/squashfs-tools/unsquashfs assets/
+            cp /tmp/squashfs-tools/squashfs-tools/mksquashfs assets/ 2>/dev/null || true
+            zstd --ultra -22 -f -o assets/unsquashfs-zst assets/unsquashfs || \
+              zstd -19 -f -o assets/unsquashfs-zst assets/unsquashfs
+            [ -f assets/mksquashfs ] && \
+              zstd --ultra -22 -f -o assets/mksquashfs-zst assets/mksquashfs || \
+              zstd -19 -f -o assets/mksquashfs-zst assets/mksquashfs
+
+            # Build squashfuse
+            git clone --depth 1 --branch 0.6.1 \
+              https://github.com/vasi/squashfuse.git /tmp/squashfuse 2>/dev/null || true
+            cd /tmp/squashfuse
+            autoreconf -fi
+            ./configure --disable-dl 2>/dev/null || ./configure --disable-dl
+            make -j\$(nproc) 2>/dev/null || make -j\$(nproc)
+            cp squashfuse /build/assets/ 2>/dev/null || true
+            cd /build
+            [ -f assets/squashfuse ] && chmod 755 assets/squashfuse && \
+              zstd --ultra -22 -f -o assets/squashfuse-zst assets/squashfuse || \
+              zstd -19 -f -o assets/squashfuse-zst assets/squashfuse
+
+            # Build zstd static library from source (not available as package on ppc64/Arch)
+            git clone --depth 1 --branch v1.5.7 \
+              https://github.com/facebook/zstd.git /tmp/zstd 2>/dev/null || true
+            make -C /tmp/zstd/lib libzstd.a -j\$(nproc) 2>/dev/null || \
+              make -C /tmp/zstd/lib libzstd.a -j\$(nproc)
+            cp /tmp/zstd/lib/libzstd.a /usr/lib/
+
+            # Build xxhash static library from source (not available as package on ppc64/Arch)
+            git clone --depth 1 --branch v0.8.3 \
+              https://github.com/Cyan4973/xxHash.git /tmp/xxhash 2>/dev/null || true
+            make -C /tmp/xxhash libxxhash.a -j\$(nproc) 2>/dev/null || \
+              make -C /tmp/xxhash libxxhash.a -j\$(nproc)
+            cp /tmp/xxhash/libxxhash.a /usr/lib/
+
+            # Download DwarFS binary
+            DWARFS_VER='0.15.3'
+            dwse_url=\"https://github.com/mhx/dwarfs/releases/download/v\${DWARFS_VER}/dwarfs-fuse-extract-\${DWARFS_VER}-Linux-ppc64\"
+            if curl -L --fail --insecure -o \"assets/dwarfsextract\" \"\${dwse_url}\"; then
+              chmod 755 assets/dwarfsextract
+              zstd --ultra -22 -f -o assets/dwarfsextract-zst assets/dwarfsextract || \
+                zstd -19 -f -o assets/dwarfsextract-zst assets/dwarfsextract
+            fi
+
+            # Build each variant
+            for variant in runimage appimage appimage-dwarfs-lite; do
+              case \$variant in
+                runimage)
+                  EXTRA='-DURUNTIME_SQUASHFS=ON -DURUNTIME_DWARFS=ON'
+                  MAGIC='RI'
+                  ;;
+                appimage)
+                  EXTRA='-DURUNTIME_APPIMAGE=ON -DURUNTIME_SQUASHFS=ON -DURUNTIME_DWARFS=ON'
+                  MAGIC='AI'
+                  ;;
+                appimage-dwarfs-lite)
+                  EXTRA='-DURUNTIME_APPIMAGE=ON -DURUNTIME_SQUASHFS=ON -DURUNTIME_LITE=ON'
+                  MAGIC='AI'
+                  ;;
+              esac
+              rm -rf build
+              cmake -S . -B build \
+                -DCMAKE_BUILD_TYPE=MinSizeRel \
+                -DURUNTIME_STATIC=ON \
+                \${EXTRA}
+              cmake --build build -j\$(nproc) 2>&1 | head -200 || {
+                echo \"Static build failed for \${variant}, retrying with dynamic linking\"
+                rm -rf build
+                cmake -S . -B build \
+                  -DCMAKE_BUILD_TYPE=MinSizeRel \
+                  -DURUNTIME_STATIC=OFF \
+                  \${EXTRA}
+                cmake --build build -j\$(nproc) 2>&1 | head -200
+              }
+              BIN_NAME=\"uruntime-\${variant}-ppc64\"
+              cp build/uruntime /\${BIN_NAME}
+              strip --strip-all /\${BIN_NAME} 2>/dev/null || true
+              printf \"\${MAGIC}\\002\" | dd of=/\${BIN_NAME} bs=1 seek=8 count=3 conv=notrunc 2>/dev/null || true
+            done
+          "
+          sudo cp ${{ github.workspace }}/ppc64-rootfs/uruntime-* .
+          sudo chown $(id -u):$(id -g) uruntime-*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uruntime-ppc64
+          path: uruntime-*-ppc64
+
+  release:
+    name: release
+    if: github.ref_name == 'action' || startsWith(github.ref, 'refs/tags/')
+    needs: [build, build_ppc64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+
+      - name: Collect files
+        run: find /tmp/artifacts -type f -exec cp {} . \;
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: uruntime*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
